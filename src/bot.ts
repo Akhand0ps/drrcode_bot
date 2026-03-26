@@ -2,7 +2,8 @@ import 'dotenv/config';
 import TelegramBot from 'node-telegram-bot-api';
 import express from 'express';
 import axios from 'axios';
-import { getSession, setSession, resetSession } from './sessions';
+import Groq from 'groq-sdk';
+import { getSession, setSession, resetSession, addMessage } from './sessions';
 import { extractTextFromPDF } from './pdfParser';
 import { scoreCV, ScoreResult } from './scorer';
 import { improveCV } from './improver';
@@ -10,6 +11,8 @@ import { generatePDF } from './pdfGenerator';
 
 const app = express();
 app.use(express.json());
+
+const groq = new Groq({ apiKey: process.env.GROQ_API_KEY! });
 
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 const BOT_TOKEN = process.env.BOT_TOKEN!;
@@ -30,7 +33,6 @@ if (IS_PRODUCTION) {
 
 function formatScoreReport(score: ScoreResult): string {
   const bar = (n: number) => 'x'.repeat(Math.floor(n / 10)) + 'o'.repeat(10 - Math.floor(n / 10));
-
   return `
 *CV Score Report*
 
@@ -50,35 +52,73 @@ ${score.gaps.map(g => `- ${g}`).join('\n')}
 ${score.missing_keywords.join(', ') || 'None'}
 
 *Verdict:* ${score.summary}
-
----
-Want me to improve your CV for this JD?
-Reply *yes* to get an improved version.
   `.trim();
 }
 
-// /start command
+async function handleFreeChat(chatId: number, userMessage: string) {
+  const session = getSession(chatId);
+
+  // Save user message to history
+  addMessage(chatId, 'user', userMessage);
+
+  // Build messages for Groq with full history
+  const systemPrompt = `You are an expert career coach and resume advisor. 
+You have access to the user's CV and the Job Description they are targeting.
+
+JOB DESCRIPTION:
+${session.jd}
+
+USER CV:
+${session.cvText}
+
+Answer the user's questions about their CV, the job role, required skills, market trends, 
+or anything career related. Be concise and specific. 
+When relevant, reference their actual CV content and the JD.`;
+
+  const messages = [
+    ...session.chatHistory.slice(0, -1).map(m => ({
+      role: m.role as 'user' | 'assistant',
+      content: m.content,
+    })),
+    { role: 'user' as const, content: userMessage },
+  ];
+
+  const response = await groq.chat.completions.create({
+    model: 'llama-3.3-70b-versatile',
+    messages: [
+      { role: 'system', content: systemPrompt },
+      ...messages,
+    ],
+  });
+
+  const reply = response.choices[0].message.content!;
+
+  // Save assistant reply to history
+  addMessage(chatId, 'assistant', reply);
+
+  return reply;
+}
+
+// /start
 bot.onText(/\/start/, (msg) => {
   resetSession(msg.chat.id);
   setSession(msg.chat.id, { step: 'WAITING_JD' });
-  bot.sendMessage(
-    msg.chat.id,
-    '*CV Scorer Bot*\n\nPaste the *Job Description* below.',
-    { parse_mode: 'Markdown' }
-  );
+  bot.sendMessage(msg.chat.id, '*CV Scorer Bot*\n\nPaste the *Job Description* below.', {
+    parse_mode: 'Markdown',
+  });
 });
 
-// /reset command
+// /reset
 bot.onText(/\/reset/, (msg) => {
   resetSession(msg.chat.id);
   bot.sendMessage(msg.chat.id, 'Reset done. Use /start to begin again.');
 });
 
-// /help command
+// /help
 bot.onText(/\/help/, (msg) => {
   bot.sendMessage(
     msg.chat.id,
-    `*CV Scorer Bot - Commands*\n\n/start - Analyze a new CV\n/reset - Start over\n/help - Show this message\n\n*How it works:*\n1. Send Job Description\n2. Upload CV as PDF\n3. Get score and improvement`,
+    `*CV Scorer Bot*\n\n/start - Analyze a new CV\n/reset - Start over\n/help - Show this message\n\n*How it works:*\n1. Send Job Description\n2. Upload CV as PDF\n3. Get score\n4. Ask anything about your CV or the role\n5. Click Improve when ready`,
     { parse_mode: 'Markdown' }
   );
 });
@@ -99,38 +139,82 @@ bot.on('message', async (msg) => {
     return;
   }
 
-  // Step 2: User replies yes/no to improve
-  if (session.step === 'SCORED') {
-    if (msg.text.toLowerCase() === 'yes') {
-      setSession(chatId, { step: 'IMPROVING' });
-      bot.sendMessage(chatId, 'Improving your CV... this may take 20-30 seconds.');
-
-      try {
-        const improved = await improveCV(session.jd!, session.cvText!);
-        const pdfBuffer = await generatePDF(improved);
-
-        await bot.sendDocument(
-          chatId,
-          pdfBuffer,
-          { caption: 'Here is your improved CV tailored to the JD.' },
-          { filename: 'improved_cv.pdf', contentType: 'application/pdf' }
-        );
-
-        resetSession(chatId);
-        bot.sendMessage(chatId, 'Done. Use /start to analyze another CV.');
-      } catch (err) {
-        console.error(err);
-        bot.sendMessage(chatId, 'Something went wrong. Try /reset and start again.');
-      }
-    } else {
-      resetSession(chatId);
-      bot.sendMessage(chatId, 'Okay. Use /start to analyze another CV anytime.');
+  // Step 2: Free chat after CV scored
+  if (session.step === 'CHATTING') {
+    try {
+      // Show typing indicator
+      bot.sendChatAction(chatId, 'typing');
+      const reply = await handleFreeChat(chatId, msg.text);
+      bot.sendMessage(chatId, reply, {
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: 'Improve my CV', callback_data: 'improve' },
+              { text: 'Start Over', callback_data: 'reset' },
+            ],
+          ],
+        },
+      });
+    } catch (err) {
+      console.error(err);
+      bot.sendMessage(chatId, 'Something went wrong. Try again.');
     }
     return;
   }
 });
 
-// PDF document handler
+// Inline button handler
+bot.on('callback_query', async (query) => {
+  const chatId = query.message!.chat.id;
+  const session = getSession(chatId);
+
+  bot.editMessageReplyMarkup(
+    { inline_keyboard: [] },
+    { chat_id: chatId, message_id: query.message!.message_id }
+  );
+
+  if (query.data === 'improve') {
+    bot.answerCallbackQuery(query.id);
+    setSession(chatId, { step: 'IMPROVING' });
+    bot.sendMessage(chatId, 'Improving your CV using our full conversation context... (20-30 seconds)');
+
+    try {
+      const improved = await improveCV(session.jd!, session.cvText!, session.chatHistory);
+      const pdfBuffer = await generatePDF(improved);
+
+      await bot.sendDocument(
+        chatId,
+        pdfBuffer,
+        { caption: 'Here is your improved CV tailored to the JD and our conversation.' },
+        { filename: 'improved_cv.pdf', contentType: 'application/pdf' }
+      );
+
+      resetSession(chatId);
+      bot.sendMessage(chatId, 'Done. Use /start to analyze another CV.', {
+        reply_markup: {
+          inline_keyboard: [[{ text: 'Analyze Another CV', callback_data: 'start' }]],
+        },
+      });
+    } catch (err) {
+      console.error(err);
+      bot.sendMessage(chatId, 'Something went wrong. Try /reset.');
+    }
+
+  } else if (query.data === 'reset') {
+    bot.answerCallbackQuery(query.id);
+    resetSession(chatId);
+    setSession(chatId, { step: 'WAITING_JD' });
+    bot.sendMessage(chatId, 'Paste the new Job Description.');
+
+  } else if (query.data === 'start') {
+    bot.answerCallbackQuery(query.id);
+    resetSession(chatId);
+    setSession(chatId, { step: 'WAITING_JD' });
+    bot.sendMessage(chatId, 'Paste the Job Description.');
+  }
+});
+
+// PDF handler
 bot.on('document', async (msg) => {
   const session = getSession(msg.chat.id);
   const chatId = msg.chat.id;
@@ -160,16 +244,30 @@ bot.on('document', async (msg) => {
     }
 
     const score = await scoreCV(session.jd!, cvText);
-    setSession(chatId, { cvText, step: 'SCORED' });
+    setSession(chatId, { cvText, step: 'CHATTING' });
 
-    bot.sendMessage(chatId, formatScoreReport(score), { parse_mode: 'Markdown' });
+    bot.sendMessage(
+      chatId,
+      formatScoreReport(score) + '\n\n---\nAsk me anything about your CV, the role, or market trends. When ready, click *Improve my CV*.',
+      {
+        parse_mode: 'Markdown',
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: 'Improve my CV', callback_data: 'improve' },
+              { text: 'Start Over', callback_data: 'reset' },
+            ],
+          ],
+        },
+      }
+    );
   } catch (err) {
     console.error(err);
     bot.sendMessage(chatId, 'Error processing your CV. Try /reset and start again.');
   }
 });
 
-// Health check endpoint for Railway
+// Health check
 app.get('/', (req, res) => {
   res.send('Bot is running.');
 });

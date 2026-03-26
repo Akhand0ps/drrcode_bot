@@ -14,18 +14,18 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.80.0",
     "@google/generative-ai": "^0.24.1",
+    "@types/node": "^25.5.0",
     "axios": "^1.13.6",
     "dotenv": "^17.3.1",
     "express": "^5.2.1",
     "groq-sdk": "^1.1.2",
     "node-telegram-bot-api": "^0.67.0",
     "pdf-parse": "^2.4.5",
-    "pdfkit": "^0.18.0"
+    "pdfkit": "^0.18.0",
+    "typescript": "^6.0.2"
   },
   "devDependencies": {
-    "@types/node": "^25.5.0",
     "@types/node-telegram-bot-api": "^0.64.14",
-    "ts-node": "^10.9.2",
-    "typescript": "^6.0.2"
+    "ts-node": "^10.9.2"
   }
 }

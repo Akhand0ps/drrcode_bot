@@ -1,4 +1,4 @@
-export type Step = 'IDLE' | 'WAITING_JD' | 'WAITING_CV' | 'CHATTING' | 'IMPROVING';
+export type Step = 'IDLE' | 'WAITING_JD' | 'WAITING_CV' | 'CHATTING' | 'IMPROVING' | 'WAITING_MULTI_JD' | 'MULTI_JD_CHATTING';
 
 export interface Message {
   role: 'user' | 'assistant';
@@ -8,8 +8,10 @@ export interface Message {
 export interface Session {
   step: Step;
   jd?: string;
+  multiJDs?: string[]; // For multi-role comparison
   cvText?: string;
   chatHistory: Message[];
+  selectedJDIndex?: number; // For tracking which JD is being discussed
 }
 
 const sessions = new Map<number, Session>();

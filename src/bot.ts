@@ -8,6 +8,10 @@ import { extractTextFromPDF } from './pdfParser';
 import { scoreCV, ScoreResult } from './scorer';
 import { improveCV } from './improver';
 import { generatePDF } from './pdfGenerator';
+import { classifyJDTitle, generateComparisonSummary, formatComparisonReport, JobComparisonResult } from './multiJobComparison';
+import { analyzeSkillsGap, formatSkillsGapReport } from './skillsGapAnalyzer';
+import { generateImprovementSuggestions, formatImprovementSuggestions } from './improvementSuggestions';
+import { generateConversationalResponse, generateInterviewQuestions, formatInterviewPrep } from './conversationalMatcher';
 
 const app = express();
 app.use(express.json());
@@ -61,42 +65,13 @@ async function handleFreeChat(chatId: number, userMessage: string) {
   // Save user message to history
   addMessage(chatId, 'user', userMessage);
 
-  // Build messages for Groq with full history
-  const systemPrompt = `You are an expert career coach and resume advisor. 
-You have access to the user's CV and the Job Description they are targeting.
-
-JOB DESCRIPTION:
-${session.jd}
-
-USER CV:
-${session.cvText}
-
-Answer the user's questions about their CV, the job role, required skills, market trends, 
-or anything career related. Be concise and specific. 
-When relevant, reference their actual CV content and the JD.`;
-
-  const messages = [
-    ...session.chatHistory.slice(0, -1).map(m => ({
-      role: m.role as 'user' | 'assistant',
-      content: m.content,
-    })),
-    { role: 'user' as const, content: userMessage },
-  ];
-
-  const response = await groq.chat.completions.create({
-    model: 'llama-3.3-70b-versatile',
-    messages: [
-      { role: 'system', content: systemPrompt },
-      ...messages,
-    ],
-  });
-
-  const reply = response.choices[0].message.content!;
+  // Use conversational matcher for smarter responses
+  const response = await generateConversationalResponse(userMessage, session.jd || session.multiJDs?.[0] || '', session.cvText || '', session.chatHistory);
 
   // Save assistant reply to history
-  addMessage(chatId, 'assistant', reply);
+  addMessage(chatId, 'assistant', response.answer);
 
-  return reply;
+  return response;
 }
 
 // /start
@@ -118,7 +93,18 @@ bot.onText(/\/reset/, (msg) => {
 bot.onText(/\/help/, (msg) => {
   bot.sendMessage(
     msg.chat.id,
-    `*CV Scorer Bot*\n\n/start - Analyze a new CV\n/reset - Start over\n/help - Show this message\n\n*How it works:*\n1. Send Job Description\n2. Upload CV as PDF\n3. Get score\n4. Ask anything about your CV or the role\n5. Click Improve when ready`,
+    `*CV Scorer Bot*\n\n*Single Role:*\n/start - Analyze a new CV versus 1 JD\n\n*Multiple Roles:*\n/compare - Compare CV against 3-5 job roles\n\n*General:*\n/reset - Start over\n/help - Show this message\n\n*How it works:*\n1. Send Job Description(s)\n2. Upload CV as PDF\n3. Get score (& comparison if multiple roles)\n4. Ask anything about your CV or the role\n5. Click Improve when ready`,
+    { parse_mode: 'Markdown' }
+  );
+});
+
+// /compare - Start multi-role comparison
+bot.onText(/\/compare/, (msg) => {
+  resetSession(msg.chat.id);
+  setSession(msg.chat.id, { step: 'WAITING_MULTI_JD', multiJDs: [] });
+  bot.sendMessage(
+    msg.chat.id,
+    `*🔥 Multi-Role Comparison Mode*\n\nSend 3-5 job descriptions to compare your CV against multiple roles.\n\n*Send them one by one* (paste each JD, then send).\n\nAfter each JD, I'll confirm. When done, type *done* and upload your CV.`,
     { parse_mode: 'Markdown' }
   );
 });
@@ -130,7 +116,7 @@ bot.on('message', async (msg) => {
   const session = getSession(msg.chat.id);
   const chatId = msg.chat.id;
 
-  // Step 1: Receive JD
+  // Step 1: Receive JD (single)
   if (session.step === 'WAITING_JD') {
     setSession(chatId, { jd: msg.text, step: 'WAITING_CV' });
     bot.sendMessage(chatId, 'JD saved. Now send your *CV as a PDF*.', {
@@ -139,15 +125,48 @@ bot.on('message', async (msg) => {
     return;
   }
 
+  // Multi-JD: Collect JDs
+  if (session.step === 'WAITING_MULTI_JD') {
+    if (msg.text.toLowerCase() === 'done') {
+      if (!session.multiJDs || session.multiJDs.length < 3) {
+        bot.sendMessage(chatId, `❌ Please send at least 3 JDs. Currently have ${session.multiJDs?.length || 0}.`);
+        return;
+      }
+      setSession(chatId, { step: 'WAITING_CV' });
+      bot.sendMessage(chatId, `✅ Got ${session.multiJDs.length} job descriptions. Now send your *CV as a PDF*.`, {
+        parse_mode: 'Markdown',
+      });
+      return;
+    }
+
+    // Add this JD to the list
+    const multiJDs = session.multiJDs || [];
+    multiJDs.push(msg.text);
+    setSession(chatId, { multiJDs });
+
+    bot.sendMessage(
+      chatId,
+      `✅ JD ${multiJDs.length} saved (${Math.min(3, 5 - multiJDs.length)} more needed to compare). Send next JD or type *done* when ready.`,
+      { parse_mode: 'Markdown' }
+    );
+    return;
+  }
+
   // Step 2: Free chat after CV scored
   if (session.step === 'CHATTING') {
     try {
       // Show typing indicator
       bot.sendChatAction(chatId, 'typing');
-      const reply = await handleFreeChat(chatId, msg.text);
-      bot.sendMessage(chatId, reply, {
+      const response = await handleFreeChat(chatId, msg.text);
+      
+      bot.sendMessage(chatId, response.answer, {
+        parse_mode: 'Markdown',
         reply_markup: {
           inline_keyboard: [
+            [
+              { text: 'Interview Prep', callback_data: 'interview_prep' },
+              { text: 'Quick Tips', callback_data: 'quick_tips' },
+            ],
             [
               { text: 'Improve my CV', callback_data: 'improve' },
               { text: 'Start Over', callback_data: 'reset' },
@@ -179,13 +198,20 @@ bot.on('callback_query', async (query) => {
     bot.sendMessage(chatId, 'Improving your CV using our full conversation context... (20-30 seconds)');
 
     try {
-      const improved = await improveCV(session.jd!, session.cvText!, session.chatHistory);
+      // Use the JD (single mode) or the first JD from multiJDs (best match)
+      const jdToUse = session.jd || session.multiJDs?.[0];
+      if (!jdToUse) {
+        bot.sendMessage(chatId, 'Error: No job description found. Try /reset and start again.');
+        return;
+      }
+
+      const improved = await improveCV(jdToUse, session.cvText!, session.chatHistory);
       const pdfBuffer = await generatePDF(improved);
 
       await bot.sendDocument(
         chatId,
         pdfBuffer,
-        { caption: 'Here is your improved CV tailored to the JD and our conversation.' },
+        { caption: 'Here is your improved CV tailored to the role and our conversation.' },
         { filename: 'improved_cv.pdf', contentType: 'application/pdf' }
       );
 
@@ -199,6 +225,108 @@ bot.on('callback_query', async (query) => {
       console.error(err);
       bot.sendMessage(chatId, 'Something went wrong. Try /reset.');
     }
+
+  } else if (query.data === 'quick_tips') {
+    bot.answerCallbackQuery(query.id);
+    const jdToUse = session.jd || session.multiJDs?.[0];
+    if (!jdToUse || !session.cvText) {
+      bot.sendMessage(chatId, 'Session error. Try /reset and start again.');
+      return;
+    }
+
+    try {
+      bot.sendChatAction(chatId, 'typing');
+      const score = await scoreCV(jdToUse, session.cvText);
+      const suggestions = await generateImprovementSuggestions(jdToUse, session.cvText, score.missing_keywords);
+      const tipsReport = formatImprovementSuggestions(suggestions);
+
+      bot.sendMessage(chatId, tipsReport, {
+        parse_mode: 'Markdown',
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: 'Back to Chat', callback_data: 'back' },
+              { text: 'Improve my CV', callback_data: 'improve' },
+            ],
+          ],
+        },
+      });
+    } catch (err) {
+      console.error(err);
+      bot.sendMessage(chatId, 'Error generating tips. Try again.');
+    }
+
+  } else if (query.data === 'interview_prep') {
+    bot.answerCallbackQuery(query.id);
+    const jdToUse = session.jd || session.multiJDs?.[0];
+    if (!jdToUse || !session.cvText) {
+      bot.sendMessage(chatId, 'Session error. Try /reset and start again.');
+      return;
+    }
+
+    try {
+      bot.sendChatAction(chatId, 'typing');
+      const questions = await generateInterviewQuestions(jdToUse, session.cvText);
+      const prepReport = formatInterviewPrep(questions);
+
+      bot.sendMessage(chatId, prepReport, {
+        parse_mode: 'Markdown',
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: 'Back to Chat', callback_data: 'back' },
+              { text: 'Quick Tips', callback_data: 'quick_tips' },
+            ],
+          ],
+        },
+      });
+    } catch (err) {
+      console.error(err);
+      bot.sendMessage(chatId, 'Error generating interview prep. Try again.');
+    }
+
+  } else if (query.data === 'skills_gap') {
+    bot.answerCallbackQuery(query.id);
+    const jdToUse = session.jd || session.multiJDs?.[0];
+    if (!jdToUse || !session.cvText) {
+      bot.sendMessage(chatId, 'Session error. Try /reset and start again.');
+      return;
+    }
+
+    try {
+      bot.sendChatAction(chatId, 'typing');
+      const score = await scoreCV(jdToUse, session.cvText);
+      const gapAnalysis = await analyzeSkillsGap(jdToUse, session.cvText, score.missing_keywords);
+      const gapReport = formatSkillsGapReport(gapAnalysis);
+
+      bot.sendMessage(chatId, gapReport, {
+        parse_mode: 'Markdown',
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: 'Back to Chat', callback_data: 'back' },
+              { text: 'Improve my CV', callback_data: 'improve' },
+            ],
+          ],
+        },
+      });
+    } catch (err) {
+      console.error(err);
+      bot.sendMessage(chatId, 'Error analyzing skills gap. Try again.');
+    }
+
+  } else if (query.data === 'back') {
+    bot.answerCallbackQuery(query.id);
+    bot.sendMessage(chatId, 'What would you like to know about your CV or this role?', {
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: 'Skills Gap Analysis', callback_data: 'skills_gap' },
+            { text: 'Improve my CV', callback_data: 'improve' },
+          ],
+        ],
+      },
+    });
 
   } else if (query.data === 'reset') {
     bot.answerCallbackQuery(query.id);
@@ -243,24 +371,76 @@ bot.on('document', async (msg) => {
       return;
     }
 
-    const score = await scoreCV(session.jd!, cvText);
-    setSession(chatId, { cvText, step: 'CHATTING' });
+    // Single JD mode
+    if (session.jd) {
+      const score = await scoreCV(session.jd, cvText);
+      setSession(chatId, { cvText, step: 'CHATTING' });
 
-    bot.sendMessage(
-      chatId,
-      formatScoreReport(score) + '\n\n---\nAsk me anything about your CV, the role, or market trends. When ready, click *Improve my CV*.',
-      {
+      bot.sendMessage(
+        chatId,
+        formatScoreReport(score) + '\n\n---\nAsk me anything about your CV, the role, or market trends. When ready, click *Improve my CV*.',
+        {
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [
+              [
+                { text: 'Quick Tips', callback_data: 'quick_tips' },
+                { text: 'Skills Gap', callback_data: 'skills_gap' },
+              ],
+              [
+                { text: 'Improve my CV', callback_data: 'improve' },
+                { text: 'Start Over', callback_data: 'reset' },
+              ],
+            ],
+          },
+        }
+      );
+      return;
+    }
+
+    // Multi-JD mode
+    if (session.multiJDs && session.multiJDs.length >= 3) {
+      bot.sendMessage(chatId, '📊 Comparing your CV against all roles... (30-45 seconds)');
+
+      const results: JobComparisonResult[] = [];
+      for (let i = 0; i < session.multiJDs.length; i++) {
+        const jdTitle = await classifyJDTitle(session.multiJDs[i]);
+        const score = await scoreCV(session.multiJDs[i], cvText);
+        results.push({
+          jdIndex: i,
+          jdTitle,
+          score,
+          rank: 0, // Will be set after sorting
+          matchReason: '',
+        });
+      }
+
+      // Sort by overall score
+      results.sort((a, b) => b.score.overall - a.score.overall);
+      results.forEach((r, idx) => (r.rank = idx + 1));
+
+      // Generate strategic summary
+      const recommendation = await generateComparisonSummary(results, cvText);
+      results.forEach(r => {
+        r.matchReason = r.score.summary;
+      });
+
+      const report = formatComparisonReport(results, recommendation);
+      setSession(chatId, { cvText, multiJDs: session.multiJDs, step: 'CHATTING' });
+
+      bot.sendMessage(chatId, report, {
         parse_mode: 'Markdown',
         reply_markup: {
           inline_keyboard: [
             [
-              { text: 'Improve my CV', callback_data: 'improve' },
+              { text: 'Improve for Best Match', callback_data: 'improve' },
               { text: 'Start Over', callback_data: 'reset' },
             ],
           ],
         },
-      }
-    );
+      });
+      return;
+    }
   } catch (err) {
     console.error(err);
     bot.sendMessage(chatId, 'Error processing your CV. Try /reset and start again.');
